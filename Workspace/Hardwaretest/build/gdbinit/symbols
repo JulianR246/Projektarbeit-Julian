@@ -1,0 +1,9 @@
+
+
+# Load bootloader symbols
+set confirm off
+    add-symbol-file C:/Users/julia/Documents/Studium/Semester7/Projektarbeit/Workspace/Hardwaretest/build/bootloader/bootloader.elf
+set confirm on
+
+# Load application symbols
+file C:/Users/julia/Documents/Studium/Semester7/Projektarbeit/Workspace/Hardwaretest/build/hello_world.elf
