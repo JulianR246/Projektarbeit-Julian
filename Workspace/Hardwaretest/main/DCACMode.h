@@ -1,0 +1,45 @@
+/*
+ * DCACMode.h
+ *
+ *  Created on: 31.10.2025
+ *      Author: Julian
+ */
+
+#ifndef MAIN_DCACMODE_H_
+#define MAIN_DCACMODE_H_
+
+#include <stdio.h>
+#include "esp_log.h"
+#include <inttypes.h>
+#include "hal/mcpwm_types.h"
+#include "sdkconfig.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_chip_info.h"
+#include "esp_flash.h"
+#include "esp_system.h"
+#include "driver/mcpwm_prelude.h"
+#include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
+#include "driver/uart.h"
+#include <string.h> 
+#include "ssd1306.h"
+#include <math.h>
+
+
+
+
+typedef enum {
+	MODE_NONE = 0,			//Kein Modus aktiv 
+	MODE_BLDC_HALL,			// BLDC Mode mit Hall-Sensoren
+	MODE_AC_SINGLE_PHASE	// Einphasiger AC-Modus
+} OperationMode_t;
+
+extern OperationMode_t currentMode;
+
+
+
+#endif /* MAIN_DCACMODE_H_ */

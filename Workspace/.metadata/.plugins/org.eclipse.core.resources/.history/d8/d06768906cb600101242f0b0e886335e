@@ -1,0 +1,29 @@
+/*
+ * DCACMode.c
+ *
+ *  Created on: 31.10.2025
+ *      Author: Julian
+ */
+
+#include "DCACMode.h"
+
+
+// Variablen zur erzeugung des Sinus Signals"
+#define LOG_TAG "AC_MODE" 
+
+#define TABLE_SIZE   256          					// Anzahl Sinus-Samples
+#define SINE_FREQ_HZ 50           					// gewünschte AC-Frequenz (z. B. 50 Hz)
+#define SAMPLE_RATE_HZ (SINE_FREQ_HZ * TABLE_SIZE)  // 50 * 256 = 12.8 kHz
+#define PI 3.14159265358979323846
+
+const static char *TAG = "example";
+static float sine_table[TABLE_SIZE];
+
+// Funktion zur Erzeugung der Sinustabelle 
+static void init_sine_table(void)
+{
+    for (int i = 0; i < TABLE_SIZE; i++) {
+        sine_table[i] = sinf(2.0f * PI * ((float)i / TABLE_SIZE)); // -1.0 … +1.0
+    }
+    ESP_LOGI(TAG, "Sine table initialized with %d samples", TABLE_SIZE);
+}

@@ -45,6 +45,8 @@ Whenever the timer value zero is reached, half of the ON time is reached.
 #include <string.h> 
 #include "ssd1306.h"
 
+#include "DCACMode.h"
+
 
 #define TIMER_RESOLUTION_HZ 	160000000  	 // Ein Tick enspricht 0,00625µs = 6,25ns
 #define EXAMPLE_TIMER_PERIOD         4000     //  40kHz
@@ -458,14 +460,27 @@ void send_data_task(void *param) {
 				BLDC_Automatic_Current = BLDC_Automatic_New;
 			}
 			
+			
+			
+			//wird das benötigt?
 			if(AC_Mode_ON_Current != AC_Mode_ON_New){
-				AC_Mode_ON_Current = AC_Mode_ON_New;
-               // Set_AC_MODE(AC_Mode_ON_New);
+				AC_Mode_ON_Current = AC_Mode_ON_New;    
             }	
 			if (Amplitude_Value_New != Amplitude_Value_Current){
                  Amplitude_Value_Current = Amplitude_Value_New;
-                //Set_AC_Amplitude(Amplitude_Value_New);
         	}
+        	
+        	
+			// Mode Update
+			if(AC_Mode_ON_New == 1){
+				currentMode = MODE_AC_SINGLE_PHASE;
+			}
+			else if(BLDC_Automatic_New == 1) {
+				currentMode = MODE_BLDC_HALL;
+			}
+			else {
+				currentMode = MODE_NONE;
+			}
 			
 				
 			//uart_flush_input(UART_PORT); // We have sucessfully read one cycle. Lets flush the input buffer
@@ -491,12 +506,22 @@ void LED_Task(void *arg)
 	
 	//TaskDelay(pdMS_TO_TICKS(4000));
 	
+	// === NEU: MODE_NONE Feedback ===
+	snprintf(display_message, sizeof(display_message), "DIY Power PCB v1");
+	ssd1306_display_text(dev_pt, 0, display_message, strlen(display_message), false);
+	
+	snprintf(display_message, sizeof(display_message), "Waiting for");
+	ssd1306_display_text(dev_pt, 2, display_message, strlen(display_message), false);
+	
+	snprintf(display_message, sizeof(display_message), "Simulink...");
+	ssd1306_display_text(dev_pt, 3, display_message, strlen(display_message), false);
+// ================================
 	
 	 while (1) {
         gpio_set_level(LED_GPIO, 1);  // LED AN
         vTaskDelay(pdMS_TO_TICKS(250));
         
-  		if(AC_Mode_ON_Current != 0){
+  		if(currentMode == MODE_AC_SINGLE_PHASE){
 			
 			ssd1306_clear_line(dev_pt, 1, false);				//Um alte Rückstände zu löschen
 			ssd1306_clear_line(dev_pt, 5, false);
@@ -513,7 +538,7 @@ void LED_Task(void *arg)
 	        ssd1306_display_text(dev_pt, 3, display_message, strlen(display_message), false); 	  
 		}
 		
-		else{
+		else if(currentMode == MODE_BLDC_HALL){
         
 	        snprintf(display_message, sizeof(display_message), "Duty U: %.1f%%", (double)Compare_Value_U_New/10.0);
 	        ssd1306_display_text(dev_pt, 0, display_message, strlen(display_message), false);    
@@ -564,58 +589,25 @@ void LED_Task(void *arg)
 	
 }
 
-
-
-	
 /*******************************************************************************************************************************/
-/*******************************Main*******************************************************************************************/
+/******************************BLDC HALL *********************************************************************************************/
 /*******************************************************************************************************************************/
 
-
-
-void app_main(void)
+void init_BLDC_HALL(void)
 {
- 	
- 	// Don not send loging data to the serial port
- 	//esp_log_level_set("*", ESP_LOG_NONE);
- 	// Create tasks
-    xTaskCreate(ADC_Task, "ADC_Task", 4096, NULL, 10, &myTaskHandle_ADC);			//kein Funktionsaufruf, Registrierung als Task die später vom FreeRTOS-Scheudler automatisch aufgerufen wird 
-    xTaskCreate(LED_Task, "LED_Task", 4096, NULL, 1, &myTaskHandle_LED);
-    xTaskCreate(send_data_task, "send_data_task", 2048, NULL, 5, NULL);
-          
-    //SSD1306_t *dev_pt = configure_OLED(TAG);    
-        
-  	// Configure ADC
-    //adc1_config_width(ADC_WIDTH_BIT_12); // Set ADC width
-    //adc1_config_channel_atten(ADC_CHANNEL_6, ADC_ATTEN_DB_12); // Set attenuation
+    ESP_LOGI(TAG, "Initializing BLDC Hall mode...");
     
-  
-    //ESP_LOGI(TAG, "Configure GPIO");
-    /*
-    gpio_config_t gpio_conf = {
-        .pin_bit_mask = (1ULL << GPIO_TOGGLE_PIN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&gpio_conf);
-	*/
-    
-    
-    /*********** Timer 0, 1, 2 anlegen in Set_Frequency *********************/
-    
+    // PWM Timer Initialisierung
     Init_Timers(Frequency_Current);
- 
- 	// Chapture Channels: Whenever a change of the hall sensors values detected an interrupt points to the main while - loop
- 
-    ESP_LOGI(TAG, "Create Hall sensor capture channels");
+
+    // Hall Sensor Capture Channels
+    ESP_LOGI(TAG, "Create Hall Sensor capture channels");
     mcpwm_cap_timer_handle_t cap_timer = NULL;
     mcpwm_capture_timer_config_t cap_timer_config = {
         .group_id = 0,
         .clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT,
-  
     };
+    
     ESP_ERROR_CHECK(mcpwm_new_capture_timer(&cap_timer_config, &cap_timer));
     mcpwm_cap_channel_handle_t cap_channels[3];
     mcpwm_capture_channel_config_t cap_channel_config = {
@@ -630,94 +622,231 @@ void app_main(void)
         ESP_ERROR_CHECK(mcpwm_new_capture_channel(cap_timer, &cap_channel_config, &cap_channels[i]));
     }
 
-    ESP_LOGI(TAG, "Register event callback for capture channels");
+	ESP_LOGI(TAG, "Register event callback for capture channels");
     TaskHandle_t task_to_notify = xTaskGetCurrentTaskHandle();
     for (int i = 0; i < 3; i++) {
         mcpwm_capture_event_callbacks_t cbs = {
             .on_cap = bldc_hall_updated,
         };
         ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(cap_channels[i], &cbs, task_to_notify));
-    }
-
-    ESP_LOGI(TAG, "Enable capture channels");
-    for (int i = 0; i < 3; i++) {
         ESP_ERROR_CHECK(mcpwm_capture_channel_enable(cap_channels[i]));
     }
 
-    ESP_LOGI(TAG, "Enable and start capture timer");
+	ESP_LOGI(TAG, "Enable and start capture timer");
     ESP_ERROR_CHECK(mcpwm_capture_timer_enable(cap_timer));
     ESP_ERROR_CHECK(mcpwm_capture_timer_start(cap_timer));
 
-	/*
-	mcpwm_capture_timer_get_resolution(cap_timer, &Test_Frequency);
-	ESP_LOGI(TAG, "Timer Resolution: %lu", Test_Frequency);
-	Test_Frequency = Test_Frequency / 1000000;
-	*/
-
-
-/******************Spielbereich **************/
-// ADC mit DAM, bisher nicht funktioniert :-()
-//https://docs.espressif.com/projects/esp-idf/en/release-v4.4/esp32/api-reference/peripherals/adc.html#_CPPv424adc_digi_configuration_t
-
-    
-
-    
-    //ESP_ERROR_CHECK(adc1_config_width(ADC_WIDTH_BIT_DEFAULT));
-    //ESP_ERROR_CHECK(adc1_config_channel_atten(ADC1_CHANNEL_6,  ADC_ATTEN_DB_12));
-    
-
-    // 4. ADC starten
-    //ret = adc_digi_start();
-    //if (ret != ESP_OK) {
-    //    ESP_LOGE(TAG, "Failed to start ADC");
-    //    return;
-    //}
-
-    // 5. Einmalige Messung durchführen
-    //uint8_t dma_buffer[2];  // Puffer zum Lesen der ADC-Daten
-    //size_t bytes_read = 0;
-
-    //ret = adc_digi_read_bytes(dma_buffer, sizeof(dma_buffer), &bytes_read, pdMS_TO_TICKS(1000));
-    //if (ret == ESP_OK && bytes_read > 0) {
-        // ADC-Wert extrahieren (12-Bit-Wert)
-    //    uint16_t adc_value = ((dma_buffer[1] << 8) | dma_buffer[0]) & 0xFFF; // 12-Bit-Wert
-    //    ESP_LOGI(TAG, "ADC Value: %d", adc_value);
-    //} else if (ret == ESP_ERR_TIMEOUT) {
-    //    ESP_LOGW(TAG, "ADC Timeout!");
-    //}
-
-    // 6. ADC stoppen und Ressourcen freigeben
-    //adc_digi_stop();
-    //adc_digi_deinitialize();
-    
-    
-    
-	
-   /******************ENDE Spielbereich **************/
-
-
-
-
-
-
-
-
-
-    while (1) {
-        //ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, Strom_V, &adc_raw[1][0]));
-        //ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, Strom_V, adc_raw[1][0]);
-        //read_adc_values();
-        //Original Example the task is triggered from the Hall Update
-                
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        //vTaskDelay(pdMS_TO_TICKS(1000));
-     }
-        
-             
-        
-        
-      
+    // ADC Task nur für BLDC-Hall
+    //xTaskCreate(ADC_Task, "ADC_Task", 4096, NULL, 10, &myTaskHandle_ADC);
 }
+
+void run_BLDC_HALL(void)
+{
+    ESP_LOGI(TAG, "Running BLDC Hall main loop...");
+    while (1)
+    {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    }
+}
+
+	
+	
+	
+	
+/*******************************************************************************************************************************/
+/*******************************Main*******************************************************************************************/
+/*******************************************************************************************************************************/
+
+
+/*	
+	void app_main(void)
+	{
+	 	
+	 	// Don not send loging data to the serial port
+	 	//esp_log_level_set("*", ESP_LOG_NONE);
+	 	// Create tasks
+	    xTaskCreate(ADC_Task, "ADC_Task", 4096, NULL, 10, &myTaskHandle_ADC);			//kein Funktionsaufruf, Registrierung als Task die später vom FreeRTOS-Scheudler automatisch aufgerufen wird 
+	    xTaskCreate(LED_Task, "LED_Task", 4096, NULL, 1, &myTaskHandle_LED);
+	    xTaskCreate(send_data_task, "send_data_task", 2048, NULL, 5, NULL);
+*/         
+	    //SSD1306_t *dev_pt = configure_OLED(TAG);    
+	        
+	  	// Configure ADC
+	    //adc1_config_width(ADC_WIDTH_BIT_12); // Set ADC width
+	    //adc1_config_channel_atten(ADC_CHANNEL_6, ADC_ATTEN_DB_12); // Set attenuation
+	    
+	  
+	    //ESP_LOGI(TAG, "Configure GPIO");
+	    /*
+	    gpio_config_t gpio_conf = {
+	        .pin_bit_mask = (1ULL << GPIO_TOGGLE_PIN),
+	        .mode = GPIO_MODE_OUTPUT,
+	        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+	        .pull_up_en = GPIO_PULLUP_DISABLE,
+	        .intr_type = GPIO_INTR_DISABLE
+	    };
+	    gpio_config(&gpio_conf);
+		*/
+	    
+	    
+	    /*********** Timer 0, 1, 2 anlegen in Set_Frequency *********************/
+/*	    
+	    Init_Timers(Frequency_Current);
+	 
+	 	// Chapture Channels: Whenever a change of the hall sensors values detected an interrupt points to the main while - loop
+	 
+	    ESP_LOGI(TAG, "Create Hall sensor capture channels");
+	    mcpwm_cap_timer_handle_t cap_timer = NULL;
+	    mcpwm_capture_timer_config_t cap_timer_config = {
+	        .group_id = 0,
+	        .clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT,
+	  
+	    };
+	    ESP_ERROR_CHECK(mcpwm_new_capture_timer(&cap_timer_config, &cap_timer));
+	    mcpwm_cap_channel_handle_t cap_channels[3];
+	    mcpwm_capture_channel_config_t cap_channel_config = {
+	        .prescale = 1,
+	        .flags.pull_up = false,
+	        .flags.neg_edge = true,
+	        .flags.pos_edge = true,
+	    };
+	    const int cap_chan_gpios[3] = {Hall_A, Hall_B, Hall_C};
+	    for (int i = 0; i < 3; i++) {
+	        cap_channel_config.gpio_num = cap_chan_gpios[i];
+	        ESP_ERROR_CHECK(mcpwm_new_capture_channel(cap_timer, &cap_channel_config, &cap_channels[i]));
+	    }
+	
+	    ESP_LOGI(TAG, "Register event callback for capture channels");
+	    TaskHandle_t task_to_notify = xTaskGetCurrentTaskHandle();
+	    for (int i = 0; i < 3; i++) {
+	        mcpwm_capture_event_callbacks_t cbs = {
+	            .on_cap = bldc_hall_updated,
+	        };
+	        ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(cap_channels[i], &cbs, task_to_notify));
+	    }
+	
+	    ESP_LOGI(TAG, "Enable capture channels");
+	    for (int i = 0; i < 3; i++) {
+	        ESP_ERROR_CHECK(mcpwm_capture_channel_enable(cap_channels[i]));
+	    }
+	
+	    ESP_LOGI(TAG, "Enable and start capture timer");
+	    ESP_ERROR_CHECK(mcpwm_capture_timer_enable(cap_timer));
+	    ESP_ERROR_CHECK(mcpwm_capture_timer_start(cap_timer));
+*/
+		/*
+		mcpwm_capture_timer_get_resolution(cap_timer, &Test_Frequency);
+		ESP_LOGI(TAG, "Timer Resolution: %lu", Test_Frequency);
+		Test_Frequency = Test_Frequency / 1000000;
+		*/
+	
+	
+	/******************Spielbereich **************/
+	// ADC mit DAM, bisher nicht funktioniert :-()
+	//https://docs.espressif.com/projects/esp-idf/en/release-v4.4/esp32/api-reference/peripherals/adc.html#_CPPv424adc_digi_configuration_t
+	
+	    
+	
+	    
+	    //ESP_ERROR_CHECK(adc1_config_width(ADC_WIDTH_BIT_DEFAULT));
+	    //ESP_ERROR_CHECK(adc1_config_channel_atten(ADC1_CHANNEL_6,  ADC_ATTEN_DB_12));
+	    
+	
+	    // 4. ADC starten
+	    //ret = adc_digi_start();
+	    //if (ret != ESP_OK) {
+	    //    ESP_LOGE(TAG, "Failed to start ADC");
+	    //    return;
+	    //}
+	
+	    // 5. Einmalige Messung durchführen
+	    //uint8_t dma_buffer[2];  // Puffer zum Lesen der ADC-Daten
+	    //size_t bytes_read = 0;
+	
+	    //ret = adc_digi_read_bytes(dma_buffer, sizeof(dma_buffer), &bytes_read, pdMS_TO_TICKS(1000));
+	    //if (ret == ESP_OK && bytes_read > 0) {
+	        // ADC-Wert extrahieren (12-Bit-Wert)
+	    //    uint16_t adc_value = ((dma_buffer[1] << 8) | dma_buffer[0]) & 0xFFF; // 12-Bit-Wert
+	    //    ESP_LOGI(TAG, "ADC Value: %d", adc_value);
+	    //} else if (ret == ESP_ERR_TIMEOUT) {
+	    //    ESP_LOGW(TAG, "ADC Timeout!");
+	    //}
+	
+	    // 6. ADC stoppen und Ressourcen freigeben
+	    //adc_digi_stop();
+	    //adc_digi_deinitialize();
+	    
+	    
+	    
+		
+	   /******************ENDE Spielbereich **************/
+	
+	
+/*	
+	    while (1) {
+	        //ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, Strom_V, &adc_raw[1][0]));
+	        //ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, Strom_V, adc_raw[1][0]);
+	        //read_adc_values();
+	        //Original Example the task is triggered from the Hall Update
+	                
+	        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+	        //vTaskDelay(pdMS_TO_TICKS(1000));
+	     }
+	             
+	      
+	}
+*/
+
+void app_main(void)				//Testing neue Main mit modularem Aufbau
+{
+    // Logging & Grundkonfiguration
+    esp_log_level_set("*", ESP_LOG_INFO);						//Für Debuggen, zeigt Infos im Terminal an
+    //init_common_peripherals();
+
+    // Tasks, die immer laufen
+    xTaskCreate(ADC_Task, "ADC_Task", 4096, NULL, 10, &myTaskHandle_ADC);
+    xTaskCreate(LED_Task, "LED_Task", 4096, NULL, 1, &myTaskHandle_LED);
+    xTaskCreate(send_data_task, "send_data_task", 2048, NULL, 5, NULL);
+
+    // Warten auf Mode-Initialisierung durch send_data_task
+    ESP_LOGI(TAG, "Waiting for mode selection from send_data_task...");
+    
+    //Warte bis Modus über UART/Simulink gewählt wurde
+    while (currentMode == MODE_NONE)
+    {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ESP_LOGI(TAG, "Mode selected: %d", currentMode);				//Info ans Terminal
+
+    // Jetzt Mode starten
+    switch (currentMode)
+    {
+        case MODE_BLDC_HALL:
+            init_BLDC_HALL();
+            run_BLDC_HALL();
+            break;
+
+        case MODE_AC_SINGLE_PHASE:
+            //init_AC_SinglePhase();
+            //run_AC_SinglePhase();
+            break;
+
+        /*case MODE_AC_TRIPLE_PHASE:
+            init_AC_TriplePhase();
+            run_AC_TriplePhase();
+            break;
+		*/
+        default:
+            ESP_LOGE(TAG, "Invalid mode!");
+            break;
+    }
+}
+
+
+
+
+
 
 
 /*******************************************************************************************************************************/

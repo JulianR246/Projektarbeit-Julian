@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "hello_world",
-    "project_version":    "1",
+    "project_version":    "6b4e0c0-dirty",
     "project_path":       "C:/Users/julia/Documents/Studium/Semester7/Projektarbeit/Workspace/Hardwaretest",
     "idf_path":           "C:/Espressif/frameworks/esp-idf-v5.5.1",
     "build_dir":          "C:/Users/julia/Documents/Studium/Semester7/Projektarbeit/Workspace/Hardwaretest/build",
@@ -1225,7 +1225,7 @@
             "managed_reqs": [],
             "managed_priv_reqs": [],
             "file": "C:/Users/julia/Documents/Studium/Semester7/Projektarbeit/Workspace/Hardwaretest/build/esp-idf/main/libmain.a",
-            "sources": [ "C:/Users/julia/Documents/Studium/Semester7/Projektarbeit/Workspace/Hardwaretest/main/hello_world_main.c" ],
+            "sources": [ "C:/Users/julia/Documents/Studium/Semester7/Projektarbeit/Workspace/Hardwaretest/main/hello_world_main.c", "C:/Users/julia/Documents/Studium/Semester7/Projektarbeit/Workspace/Hardwaretest/main/DCACMode.c" ],
             "include_dirs": []
         },
         "mbedtls": {

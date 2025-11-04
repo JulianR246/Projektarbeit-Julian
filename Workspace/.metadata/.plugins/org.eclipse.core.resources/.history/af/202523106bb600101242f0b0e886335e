@@ -1,0 +1,29 @@
+/*
+ * DCACMode.h
+ *
+ *  Created on: 31.10.2025
+ *      Author: Julian
+ */
+
+#ifndef MAIN_DCACMODE_H_
+#define MAIN_DCACMODE_H_
+
+
+typedef enum {
+	MODE_BLDC_HALL = 0;
+	MODE_AC_SINGLE_PHASE
+} OperationMode_t;
+
+
+
+
+
+
+
+
+
+
+
+
+
+#endif /* MAIN_DCACMODE_H_ */
