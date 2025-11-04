@@ -8,7 +8,7 @@
 #include "DCACMode.h"
 
 
-OperationMode_t currentMode = MODE_BLDC_HALL; //Standard: kein aktiver Modus      //umgeändert
+OperationMode_t currentMode = MODE_NONE; //Standard: kein aktiver Modus      //umgeändert
 
 
 // Variablen zur erzeugung des Sinus Signals"

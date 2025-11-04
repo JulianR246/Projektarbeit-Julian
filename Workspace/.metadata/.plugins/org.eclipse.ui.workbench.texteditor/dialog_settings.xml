@@ -6,30 +6,30 @@
 		<item key="wholeword" value="false"/>
 		<item key="incremental" value="false"/>
 		<item key="isRegEx" value="false"/>
-		<item key="selection" value="connection_ready"/>
+		<item key="selection" value="adc_conversion_done"/>
 		<list key="findhistory">
+			<item value="adc_conversion_done"/>
+			<item value="timer0_isr"/>
+			<item value="timer"/>
+			<item value="app_main"/>
+			<item value="send_data"/>
+			<item value="send"/>
+			<item value="clear_screen"/>
+			<item value="LED"/>
+			<item value="BLDC_Automatic"/>
+			<item value="currentMode"/>
+			<item value="Amplitude_Value_New"/>
+			<item value="BLDC_Automatic_New"/>
 			<item value="connection_ready"/>
 			<item value="configure_OLED"/>
 			<item value="HTWG"/>
-			<item value="send"/>
-			<item value="ADC_Task"/>
-			<item value="ADC"/>
-			<item value="generators"/>
-			<item value="send_data"/>
-			<item value="bldc_hall_control_loop"/>
-			<item value="bldc_hall_updated"/>
-			<item value="LED_Task"/>
-			<item value="Hall_A"/>
-			<item value="cap_channels"/>
-			<item value="Init"/>
-			<item value="xTaskCreate"/>
 		</list>
 		<list key="replacehistory">
 		</list>
 	</section>
 	<section name="org.eclipse.ui.texteditor.FindReplaceDialog_dialogBounds">
-		<item key="DIALOG_X_ORIGIN" value="1450"/>
-		<item key="DIALOG_Y_ORIGIN" value="399"/>
+		<item key="DIALOG_X_ORIGIN" value="1895"/>
+		<item key="DIALOG_Y_ORIGIN" value="59"/>
 		<item key="DIALOG_WIDTH" value="511"/>
 		<item key="DIALOG_HEIGHT" value="523"/>
 		<item key="DIALOG_FONT_NAME" value="1|Segoe UI|9.0|0|WINDOWS|1|-18|0|0|0|400|0|0|0|1|0|0|0|0|Segoe UI"/>

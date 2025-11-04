@@ -25,6 +25,7 @@ Whenever the timer value zero is reached, half of the ON time is reached.
 
  */
 
+#include <stdint.h>
 #include <stdio.h>
 #include "esp_log.h"
 #include <inttypes.h>
@@ -140,11 +141,7 @@ uint32_t Phase_W_New			 = 0;
 uint16_t Sequence_Current		 = 0; // Bridge Sequence UH UL VH VL WH WL, Start with all off
 uint16_t Sequence_New			 = 0;
 
-uint16_t BLDC_Automatic_Current  = 0;
-uint16_t BLDC_Automatic_New 	 = 0;
-
-uint16_t AC_Mode_ON_Current = 0;
-uint16_t AC_Mode_ON_New = 0;
+uint16_t Mode  = 0;
 
 uint16_t Amplitude_Value_Current = 0;
 uint16_t Amplitude_Value_New = 0;
@@ -213,7 +210,7 @@ static bool IRAM_ATTR bldc_hall_updated(mcpwm_cap_channel_handle_t cap_channel, 
     
     hall_val = gpio_get_level(Hall_A) * 4 + gpio_get_level(Hall_B) * 2 + gpio_get_level(Hall_C) * 1;
          
-        if(BLDC_Automatic_Current == 1){
+        if(currentMode == MODE_BLDC_HALL){
 			Set_Hall_Sequence();}
     
     
@@ -342,7 +339,7 @@ void send_data_task(void *param) {
     uint8_t Header[1] = {'X'};
     uint8_t Terminator[1] = {'Y'};
     // Payload data receive vector
-    uint8_t data[24];
+    uint8_t data[22];
    
 
 
@@ -397,11 +394,11 @@ void send_data_task(void *param) {
         uart_get_buffered_data_len(UART_PORT, &available); // Get the number of available Data within the input buffer
         // We need to receive X Data packages with 8 bit
         // As we transmitt 16bit values we need to assemble them to uint16
-        if (available >= 24) {
+        if (available >= 22) {
             
             clear_welcome_screen = true;
             connection_ready = true;
-            int len = uart_read_bytes(UART_PORT, data, 24, 0); // Daten ohne Timeout lesen
+            int len = uart_read_bytes(UART_PORT, data, 22, 0); // Daten ohne Timeout lesen
             //Empfangsdaten zusammenbauen
             Counter_Received 	= (data[1] << 8) | data[0]; 
             Compare_Value_U_New = (data[3] << 8) | data[2];
@@ -412,9 +409,8 @@ void send_data_task(void *param) {
             Phase_V_New			= (data[13] << 8) | data[12];
             Phase_W_New			= (data[15] << 8) | data[14];
             Sequence_New		= (data[17] << 8) | data[16];
-            BLDC_Automatic_New	= (data[19] << 8) | data[18];
-            AC_Mode_ON_New      = (data[21] << 8) | data[20];
-			Amplitude_Value_New = (data[23] << 8) | data[22];
+            Mode				= (data[19] << 8) | data[18];
+			Amplitude_Value_New = (data[21] << 8) | data[20];
             
             // If something changed, set the new values            
             if (Compare_Value_U_New != Compare_Value_U_Current){
@@ -444,44 +440,40 @@ void send_data_task(void *param) {
 			if (Phase_W_New != Phase_W_Current){
 				Phase_W_Current = Phase_W_New;
 				Set_Phase_W(Phase_W_New);}
-			if (Sequence_Current != Sequence_New && BLDC_Automatic_Current == 0){
+			if (Sequence_Current != Sequence_New && currentMode == MODE_NONE){
 				Sequence_Current = Sequence_New;
 				Set_Sequence(Sequence_New);
 				}	
-			// UPtdate the Sequence at the first Start. Otherwise the ISR is not updated
-			if (BLDC_Automatic_New == 1 && BLDC_Automatic_Current == 0)
+				
+				
+			if(Mode == MODE_BLDC_HALL && currentMode != MODE_BLDC_HALL)
 			{
 				hall_val = gpio_get_level(Hall_A) * 4 + gpio_get_level(Hall_B) * 2 + gpio_get_level(Hall_C) * 1;
 				Set_Hall_Sequence();			
-				BLDC_Automatic_Current = BLDC_Automatic_New;	
+				currentMode = MODE_BLDC_HALL;
 			}
-			else if (BLDC_Automatic_New == 0 && BLDC_Automatic_Current == 1){
+			else if (Mode == MODE_NONE && currentMode == MODE_BLDC_HALL)
+			{
 				Set_Sequence(0); // Turn all off
-				BLDC_Automatic_Current = BLDC_Automatic_New;
+				currentMode = MODE_NONE;
 			}
 			
-			
-			
-			//wird das benötigt?
-			if(AC_Mode_ON_Current != AC_Mode_ON_New){
-				AC_Mode_ON_Current = AC_Mode_ON_New;    
-            }	
+			else if(Mode == MODE_AC_SINGLE_PHASE && currentMode != MODE_AC_SINGLE_PHASE)
+			{
+				//TODO: Platzhalter, muss hier was rein oder reicht es in main zu initalisieren?
+				currentMode = MODE_AC_SINGLE_PHASE;
+			}	
+			else if(Mode == MODE_NONE && currentMode == MODE_AC_SINGLE_PHASE)
+			{
+				currentMode = MODE_NONE;
+			}
+
+
+
 			if (Amplitude_Value_New != Amplitude_Value_Current){
                  Amplitude_Value_Current = Amplitude_Value_New;
         	}
         	
-        	
-			// Mode Update
-			if(AC_Mode_ON_New == 1){
-				currentMode = MODE_AC_SINGLE_PHASE;
-			}
-			else if(BLDC_Automatic_New == 1) {
-				currentMode = MODE_BLDC_HALL;
-			}
-			else {
-				currentMode = MODE_NONE;
-			}
-			
 				
 			//uart_flush_input(UART_PORT); // We have sucessfully read one cycle. Lets flush the input buffer
            
@@ -506,30 +498,25 @@ void LED_Task(void *arg)
 	
 	//TaskDelay(pdMS_TO_TICKS(4000));
 	
-	// === NEU: MODE_NONE Feedback ===
-	snprintf(display_message, sizeof(display_message), "DIY Power PCB v1");
-	ssd1306_display_text(dev_pt, 0, display_message, strlen(display_message), false);
-	
-	snprintf(display_message, sizeof(display_message), "Waiting for");
-	ssd1306_display_text(dev_pt, 2, display_message, strlen(display_message), false);
-	
-	snprintf(display_message, sizeof(display_message), "Simulink...");
-	ssd1306_display_text(dev_pt, 3, display_message, strlen(display_message), false);
-// ================================
 	
 	 while (1) {
         gpio_set_level(LED_GPIO, 1);  // LED AN
         vTaskDelay(pdMS_TO_TICKS(250));
         
-  		if(currentMode == MODE_AC_SINGLE_PHASE){
-			
-			ssd1306_clear_line(dev_pt, 1, false);				//Um alte Rückstände zu löschen
-			ssd1306_clear_line(dev_pt, 5, false);
-			ssd1306_clear_line(dev_pt, 6, false);
-			ssd1306_clear_line(dev_pt, 7, false);
-			
-			snprintf(display_message, sizeof(display_message), "AC Mode: %.1f", (double)AC_Mode_ON_Current);
-	        ssd1306_display_text(dev_pt, 0, display_message, strlen(display_message), false);    
+        
+        static uint8_t lastMode = MODE_NONE;
+        if(currentMode != lastMode){
+			ssd1306_clear_screen(dev_pt, false);
+			lastMode = currentMode;
+		}
+        
+        
+        if(currentMode == MODE_NONE){
+        	ssd1306_display_text(dev_pt, 2, "Waehle einen", strlen("Waehle einen"), false);
+			ssd1306_display_text(dev_pt, 3, "Modus", strlen("Modus"), false);
+        }
+        
+  		else if(currentMode == MODE_AC_SINGLE_PHASE){   
 	        
 	        snprintf(display_message, sizeof(display_message), "Amplitude : %.1f V", (double)Amplitude_Value_Current);
 	        ssd1306_display_text(dev_pt, 2, display_message, strlen(display_message), false); 
@@ -557,6 +544,7 @@ void LED_Task(void *arg)
 	        snprintf(display_message, sizeof(display_message), "%u %u %u %u %u %u", UH, UL, VH, VL, WH, WL);
 	        ssd1306_display_text(dev_pt, 6, display_message, strlen(display_message), false);    
         }
+        
         
         if (connection_ready == true)
         {
@@ -658,7 +646,7 @@ void run_BLDC_HALL(void)
 /*******************************************************************************************************************************/
 
 
-/*	
+
 	void app_main(void)
 	{
 	 	
@@ -668,13 +656,13 @@ void run_BLDC_HALL(void)
 	    xTaskCreate(ADC_Task, "ADC_Task", 4096, NULL, 10, &myTaskHandle_ADC);			//kein Funktionsaufruf, Registrierung als Task die später vom FreeRTOS-Scheudler automatisch aufgerufen wird 
 	    xTaskCreate(LED_Task, "LED_Task", 4096, NULL, 1, &myTaskHandle_LED);
 	    xTaskCreate(send_data_task, "send_data_task", 2048, NULL, 5, NULL);
-*/         
+         
 	    //SSD1306_t *dev_pt = configure_OLED(TAG);    
 	        
 	  	// Configure ADC
 	    //adc1_config_width(ADC_WIDTH_BIT_12); // Set ADC width
 	    //adc1_config_channel_atten(ADC_CHANNEL_6, ADC_ATTEN_DB_12); // Set attenuation
-	    
+
 	  
 	    //ESP_LOGI(TAG, "Configure GPIO");
 	    /*
@@ -690,9 +678,9 @@ void run_BLDC_HALL(void)
 	    
 	    
 	    /*********** Timer 0, 1, 2 anlegen in Set_Frequency *********************/
-/*	    
+	    
 	    Init_Timers(Frequency_Current);
-	 
+/*	 
 	 	// Chapture Channels: Whenever a change of the hall sensors values detected an interrupt points to the main while - loop
 	 
 	    ESP_LOGI(TAG, "Create Hall sensor capture channels");
@@ -782,7 +770,7 @@ void run_BLDC_HALL(void)
 	   /******************ENDE Spielbereich **************/
 	
 	
-/*	
+/*
 	    while (1) {
 	        //ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, Strom_V, &adc_raw[1][0]));
 	        //ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, Strom_V, adc_raw[1][0]);
@@ -793,10 +781,10 @@ void run_BLDC_HALL(void)
 	        //vTaskDelay(pdMS_TO_TICKS(1000));
 	     }
 	             
-	      
+*/	      
 	}
-*/
 
+/*
 void app_main(void)				//Testing neue Main mit modularem Aufbau
 {
     // Logging & Grundkonfiguration
@@ -810,39 +798,40 @@ void app_main(void)				//Testing neue Main mit modularem Aufbau
 
     // Warten auf Mode-Initialisierung durch send_data_task
     ESP_LOGI(TAG, "Waiting for mode selection from send_data_task...");
-    
-    //Warte bis Modus über UART/Simulink gewählt wurde
+ */
+    /*Warte bis Modus über UART/Simulink gewählt wurde
     while (currentMode == MODE_NONE)
     {
         vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
+    }*/
+/*
     ESP_LOGI(TAG, "Mode selected: %d", currentMode);				//Info ans Terminal
-
-    // Jetzt Mode starten
-    switch (currentMode)
-    {
-        case MODE_BLDC_HALL:
-            init_BLDC_HALL();
-            run_BLDC_HALL();
-            break;
-
-        case MODE_AC_SINGLE_PHASE:
-            //init_AC_SinglePhase();
-            //run_AC_SinglePhase();
-            break;
-
-        /*case MODE_AC_TRIPLE_PHASE:
-            init_AC_TriplePhase();
-            run_AC_TriplePhase();
-            break;
-		*/
-        default:
-            ESP_LOGE(TAG, "Invalid mode!");
-            break;
-    }
+	while(1)
+	{
+	    // Jetzt Mode starten
+	    switch (currentMode)
+	    {
+	        case MODE_BLDC_HALL:
+	            init_BLDC_HALL();
+	            run_BLDC_HALL();
+	            break;
+	
+	        case MODE_AC_SINGLE_PHASE:
+	            //init_AC_SinglePhase();
+	            //run_AC_SinglePhase();
+	            break;
+	        case MODE_NONE:
+	        break;
+	
+		    default:
+	        ESP_LOGE(TAG, "Invalid mode!");
+	        break;
+	    }
+	vTaskDelay(pdMS_TO_TICKS(100));
+	}
 }
 
+*/
 
 
 

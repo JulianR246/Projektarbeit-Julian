@@ -1,0 +1,1229 @@
+/*
+Three independent inverted PWM signals phase U, V, W with adjustable
+duty, frequency and Deadtime. 
+To verify the serial transmission to a host, a counter value is transmitted and read back.
+Phase_V_Current and Phase_W_Current can set a phase delay in resepct of phase u.
+
+PWM is implemented as synchronous pwm with an up down counter. Period is the variable
+to set the overal period which means up puls down. A phase shift is thus only possible up
+to Period/2 -1 -> close to 180° degree.
+
+
+   /\      /\
+  /  \    /  \
+ /    \  /    \
+/      \/      \
+  T/2  T
+  
+Example: Period = 4000 results in40kHz.
+SPWM clock = 160MHz / 4000 -> 40kHz
+Every counter counts from 0 ... 2000 and back to 0.
+
+For Low and High-Side signals the comparator are used the same way. The inverting
+behaviour of the low-Side is set within the dead-time generator.
+Whenever the timer value zero is reached, half of the ON time is reached. 
+
+ */
+
+#include <stdint.h>
+#include <stdio.h>
+#include "esp_log.h"
+#include <inttypes.h>
+#include "hal/mcpwm_types.h"
+#include "sdkconfig.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_chip_info.h"
+#include "esp_flash.h"
+#include "esp_system.h"
+#include "driver/mcpwm_prelude.h"
+#include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
+#include "driver/uart.h"
+#include <string.h> 
+#include "ssd1306.h"
+
+#include "DCACMode.h"
+
+
+#define TIMER_RESOLUTION_HZ 	160000000  	 // Ein Tick enspricht 0,00625µs = 6,25ns
+#define EXAMPLE_TIMER_PERIOD         4000     //  40kHz
+
+// Ports for PWM Signals
+#define BLDC_PWM_UH_GPIO          	 26
+#define BLDC_PWM_UL_GPIO          25
+#define BLDC_PWM_VH_GPIO         	 14
+#define BLDC_PWM_VL_GPIO          27
+#define BLDC_PWM_WH_GPIO         	 13
+#define BLDC_PWM_WL_GPIO          12
+
+
+// Bridge Setting
+bool UH = 0;
+bool UL = 0;
+bool VH = 0;
+bool VL = 0;
+bool WH = 0;
+bool WL = 0;
+
+
+// Ports for Hall signals
+#define Hall_A						4
+#define Hall_B						16
+#define Hall_C						17
+uint16_t hall_val = 7; 				// 7 ist ein illegaler Zustand. Wird er zurückgemeldet -> Fehler
+
+// ADC Werte
+#define Strom_U						ADC_CHANNEL_6		//PIN 34
+#define Strom_V						ADC_CHANNEL_3		//PIN 39
+#define Strom_W						ADC_CHANNEL_0		//PIN 36
+#define I_BRIDGE					ADC_CHANNEL_7		//PIN 35
+#define TORQUE						ADC_CHANNEL_4		//PIN 32
+#define U_POWER						ADC_CHANNEL_5		//PIN 33
+
+// Display GPIOs
+#define CONFIG_SDA_GPIO				21			
+#define CONFIG_SCL_GPIO				22
+char display_message[50]; 			// Display news buffer
+bool clear_welcome_screen = false;
+bool connection_ready     = false;
+
+static int Value_Strom_U = 0;
+static int Value_Strom_V = 0;
+static int Value_Strom_W = 0;
+static int Value_I_BRIDGE = 0;
+static int Value_TORQUE = 0;
+static int Value_U_POWER = 0;
+
+
+// GPIO-Pin zum Toggeln TESTEN
+//#define GPIO_TOGGLE_PIN GPIO_NUM_23
+#define LED_GPIO GPIO_NUM_2  // GPIO für die LED
+
+#define UART_PORT UART_NUM_0
+#define BUF_SIZE (1024)
+
+uint16_t Counter = 0; 			//  Global counter to check the seriel transmission. Incremented in Task LED
+uint16_t Counter_Received = 0;	//  Received counter value to check the serial transmission.
+
+
+// timers[0] -> Timer for phase U
+// timers[1] -> Timer for phase V
+// timers[2] -> Timer for phase W
+
+const static char *TAG = "example";
+
+
+uint32_t Compare_Value_U_Current = 0;
+uint32_t Compare_Value_V_Current = 0;
+uint32_t Compare_Value_W_Current = 0;
+
+uint32_t Compare_Value_U_New = 0;
+uint32_t Compare_Value_V_New = 0;
+uint32_t Compare_Value_W_New = 0;
+
+uint32_t Deadtime_Current    = 160;
+uint32_t Deadtime_New		 = 160;
+
+uint32_t Frequency_Current	 = 4000; //Start with 4kHz
+uint32_t Frequency_New	     = 4000; //Start with 4kHz
+uint32_t Period 			 = 0;
+
+uint32_t Phase_V_Current		 = 0;
+uint32_t Phase_V_New			 = 0;
+
+uint32_t Phase_W_Current		 = 0;
+uint32_t Phase_W_New			 = 0;
+
+uint16_t Sequence_Current		 = 0; // Bridge Sequence UH UL VH VL WH WL, Start with all off
+uint16_t Sequence_New			 = 0;
+
+uint16_t Mode  = 0;
+
+uint16_t Amplitude_Value_Current = 0;
+uint16_t Amplitude_Value_New = 0;
+
+mcpwm_timer_handle_t timers[3];
+mcpwm_oper_handle_t operators[3];
+mcpwm_cmpr_handle_t comparators[3];
+mcpwm_gen_handle_t generators[3][2] = {};
+mcpwm_generator_config_t gen_config = {};
+mcpwm_sync_handle_t timer_sync_source = NULL;
+
+
+static volatile bool adc_conversion_done = false; 
+
+adc_oneshot_unit_handle_t adc1_handle;
+
+void Set_New_Cmp_Value_U(uint32_t CMP_Percent_Val, uint8_t Port);
+void Set_Deadtime(uint32_t Deadtime);
+void Init_Timers(uint16_t Frequency);
+void Set_Frequency_Dynamic(uint16_t Frequency);
+void Set_Phase_V(uint16_t Phase);
+void Set_Phase_W(uint16_t Phase);
+void Set_Sequence(uint16_t Sequence);
+void Set_Hall_Sequence(void);
+//void SSD1306_t *configure_OLED(const char *TAG);
+
+volatile uint32_t last_capture_time = 0;
+volatile uint32_t time_difference = 0;
+volatile uint16_t time_difference_16 = 0;
+
+uint32_t Test_Frequency = 0;
+
+
+SSD1306_t *configure_OLED(const char *TAG)
+{
+    static SSD1306_t dev;
+	//int center, top, bottom;
+	//char lineChar[20];
+
+    i2c_master_init(&dev, CONFIG_SDA_GPIO, CONFIG_SCL_GPIO, CONFIG_RESET_GPIO);
+    ESP_LOGI(TAG, "Panel is 128x64");
+	ssd1306_init(&dev, 128, 64);
+    ssd1306_clear_screen(&dev, false);
+	ssd1306_contrast(&dev, 0xff);
+	//ssd1306_display_text_x3(&dev, 0, "DIY", 3, false);
+	ssd1306_display_text_x3(&dev, 0, "Power", 5, false);
+	ssd1306_display_text_x3(&dev, 3, "PCB", 3, false);
+	ssd1306_display_text(&dev,7, "HTWG", 4, false);
+	
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    ssd1306_clear_screen(&dev, false);
+    return &dev;
+}
+
+
+
+/*******************************************************************************************************************************/
+/******************************ISR *********************************************************************************************/
+/*******************************************************************************************************************************/
+
+
+static bool IRAM_ATTR bldc_hall_updated(mcpwm_cap_channel_handle_t cap_channel, const mcpwm_capture_event_data_t *edata, void *user_data)
+{
+    
+    double U = 0;
+    
+    hall_val = gpio_get_level(Hall_A) * 4 + gpio_get_level(Hall_B) * 2 + gpio_get_level(Hall_C) * 1;
+         
+        if(currentMode == MODE_BLDC_HALL){
+			Set_Hall_Sequence();}
+    
+    
+    uint32_t current_time = edata->cap_value; // Save Data
+    
+    // Calculate Time Difference
+    time_difference = current_time - last_capture_time;
+    last_capture_time = current_time;
+    
+    U = (double)time_difference * 0.0125; // between two ticks in µs. One Tick = 12.ns, 80MHz Capture Timer
+    //U = (double)time_difference * 12.5; // between two ticks in µs. One Tick = 12.ns, 80MHz Capture Timer
+    //U = time_difference / 1000.0; // in us 
+    U = U * 24.0; // 24 Triggers per 360°
+    U = 60000000.0 / U;
+    
+    //U = U * 20.0; // Time for one round in µs
+    //U = 60000000 / U; // RPM
+    
+     
+    time_difference_16 = (uint16_t)U;
+    
+    //time_difference_16 = (uint16_t)(time_difference >> 8);
+    
+    TaskHandle_t task_to_notify = (TaskHandle_t)user_data;
+    BaseType_t high_task_wakeup = pdFALSE;
+    vTaskNotifyGiveFromISR(task_to_notify, &high_task_wakeup);
+    return high_task_wakeup == pdTRUE;
+}
+
+
+
+void read_adc_values(void);
+
+//ISR für Timer0, die GPIO 32 toggelt
+	static bool IRAM_ATTR timer0_isr(mcpwm_timer_handle_t timer, const mcpwm_timer_event_data_t *event_data, void *user_data) {
+ 
+    adc_conversion_done = true;  
+    //gpio_set_level(GPIO_TOGGLE_PIN,1);
+    //ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL_6, &adc_value));  // dauert ca. 40µs welches ca. 25 kHz entspricht
+    //adc_value = adc1_get_raw(ADC_CHANNEL_6); // Get ADC value
+    //gpio_set_level(GPIO_TOGGLE_PIN,0);
+  
+    return true; // Rückgabe von true, um die ISR als verarbeitet zu markieren
+	}
+
+/*******************************************************************************************************************************/
+/*******************************TASKs*******************************************************************************************/
+/*******************************************************************************************************************************/
+	
+TaskHandle_t myTaskHandle_ADC = NULL;
+TaskHandle_t myTaskHandle_LED = NULL;
+
+
+void ADC_Task(void *arg)
+{
+    //ADC with OneSotRead
+   
+    //ESP_LOGI(TAG, "ADC_INIT");
+    //-------------ADC1 Init---------------//
+   
+    adc_oneshot_unit_init_cfg_t init_config1 = {
+        .unit_id = ADC_UNIT_1,
+        ADC_DIGI_CLK_SRC_PLL_F160M,
+        ADC_ULP_MODE_DISABLE,
+        
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+    
+    //-------------ADC1 Config---------------//
+    adc_oneshot_chan_cfg_t config = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    
+    adc_oneshot_config_channel(adc1_handle, Strom_U, &config);
+    adc_oneshot_config_channel(adc1_handle, Strom_V, &config);
+    adc_oneshot_config_channel(adc1_handle, Strom_W, &config);
+    adc_oneshot_config_channel(adc1_handle, I_BRIDGE, &config);
+    adc_oneshot_config_channel(adc1_handle, TORQUE, &config);
+    adc_oneshot_config_channel(adc1_handle, U_POWER, &config);     
+      
+    while(1){
+		
+        if (adc_conversion_done) {
+            // Read ADC value here
+            //gpio_set_level(GPIO_TOGGLE_PIN,1);
+            adc_oneshot_read(adc1_handle, Strom_U, &Value_Strom_U);
+            adc_oneshot_read(adc1_handle, Strom_V, &Value_Strom_V);
+            adc_oneshot_read(adc1_handle, Strom_W, &Value_Strom_W);
+            adc_oneshot_read(adc1_handle, I_BRIDGE, &Value_I_BRIDGE);
+            adc_oneshot_read(adc1_handle, TORQUE, &Value_TORQUE);
+            adc_oneshot_read(adc1_handle, U_POWER, &Value_U_POWER);
+            
+            //printf("ADC Value: %d\n", (uint16_t)Value_Strom_U);
+            //gpio_set_level(GPIO_TOGGLE_PIN,0);
+            adc_conversion_done = false; // Reset the flag
+            
+    		}
+    		else {
+			vTaskDelay(pdMS_TO_TICKS(10));  // 10ms Pause 
+			}
+    	   		
+    	}
+    	
+}
+
+// Data is send to Simulink and read back.
+// Read data are stored within values
+// Take care: The number of send and received date has to match with the sender
+
+void send_data_task(void *param) {
+
+ 
+    // uart_write_bytes is maybe developed to send only character signs. As we want to transmit binary data
+    // we have to use strigs
+    uint16_t Value_Strom_U16[1] = {0};
+    uint16_t Value_Strom_V16[1] = {0};
+    uint16_t Value_Strom_W16[1] = {0};
+    uint16_t Value_I_BRIDGE16[1] = {0};
+    uint16_t Value_TORQUE16[1] = {0};
+    uint16_t Value_U_POWER16[1] = {0};
+    uint16_t Counter_Received_Array[1] = {0};
+    uint16_t Hall_Read[1] = {0};
+    uint16_t Hall_High_Time[1] = {0};
+    // For robust transmission to Simulink we us a Header X and Terminator. Both values need to be 8it characters
+    uint8_t Header[1] = {'X'};
+    uint8_t Terminator[1] = {'Y'};
+    // Payload data receive vector
+    uint8_t data[22];
+   
+
+
+	const uart_config_t uart_config = {
+	        .baud_rate = 115200,
+	        .data_bits = UART_DATA_8_BITS,
+	        .parity = UART_PARITY_EVEN,
+	        .stop_bits = UART_STOP_BITS_1,
+	        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+	    };
+	
+	    // Install UART driver
+	    uart_driver_install(UART_PORT, BUF_SIZE, 0, 0, NULL, 0);
+	    uart_param_config(UART_PORT, &uart_config);
+	    uart_set_pin(UART_PORT, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+
+     while (1) {
+       
+        //Gather all valid information to transmitt
+		Value_Strom_U16[0] =(uint16_t)Value_Strom_U;
+		//Value_Strom_U16[0] =Sequence_New; // Debug
+		Value_Strom_V16[0] =(uint16_t)Value_Strom_V;
+		Value_Strom_W16[0] =(uint16_t)Value_Strom_W;
+		Value_I_BRIDGE16[0] =(uint16_t)Value_I_BRIDGE;
+		Value_TORQUE16[0] =(uint16_t)Value_TORQUE;
+		Value_U_POWER16[0] =(uint16_t)Value_U_POWER;
+		Hall_Read[0] 	   = hall_val;
+		Hall_High_Time[0]  = time_difference_16;
+		
+		Counter_Received_Array[0] = Counter_Received;
+	
+        // Send Values to UART
+        uart_write_bytes(UART_PORT, (const char *)Header, sizeof(Header));
+        // Payload
+        uart_write_bytes(UART_PORT, (const char *)&Counter, sizeof(Counter));
+        uart_write_bytes(UART_PORT, (const char *)Counter_Received_Array, sizeof(Counter_Received_Array[0]));
+        uart_write_bytes(UART_PORT, (const char *)Value_Strom_U16, sizeof(Value_Strom_U16[0]));
+        uart_write_bytes(UART_PORT, (const char *)Value_Strom_V16, sizeof(Value_Strom_V16[0]));
+        uart_write_bytes(UART_PORT, (const char *)Value_Strom_W16, sizeof(Value_Strom_W16[0]));
+        uart_write_bytes(UART_PORT, (const char *)Value_I_BRIDGE16, sizeof(Value_I_BRIDGE16[0]));
+        uart_write_bytes(UART_PORT, (const char *)Value_TORQUE16, sizeof(Value_TORQUE16[0]));
+        uart_write_bytes(UART_PORT, (const char *)Value_U_POWER16, sizeof(Value_U_POWER16[0]));
+        uart_write_bytes(UART_PORT, (const char *)Hall_Read, sizeof(Hall_Read[0]));
+        uart_write_bytes(UART_PORT, (const char *)Hall_High_Time, sizeof(Hall_High_Time[0]));
+        // Payload ende
+        uart_write_bytes(UART_PORT, (const char *)Terminator, sizeof(Terminator));
+		
+		
+		// Read Uart Data if available
+		size_t available = 0;
+        uart_get_buffered_data_len(UART_PORT, &available); // Get the number of available Data within the input buffer
+        // We need to receive X Data packages with 8 bit
+        // As we transmitt 16bit values we need to assemble them to uint16
+        if (available >= 22) {
+            
+            clear_welcome_screen = true;
+            connection_ready = true;
+            int len = uart_read_bytes(UART_PORT, data, 22, 0); // Daten ohne Timeout lesen
+            //Empfangsdaten zusammenbauen
+            Counter_Received 	= (data[1] << 8) | data[0]; 
+            Compare_Value_U_New = (data[3] << 8) | data[2];
+            Compare_Value_V_New = (data[5] << 8) | data[4];
+            Compare_Value_W_New = (data[7] << 8) | data[6];
+            Deadtime_New		= (data[9] << 8) | data[8];
+            Frequency_New		= (data[11] << 8) | data[10];
+            Phase_V_New			= (data[13] << 8) | data[12];
+            Phase_W_New			= (data[15] << 8) | data[14];
+            Sequence_New		= (data[17] << 8) | data[16];
+            Mode				= (data[19] << 8) | data[18];
+			Amplitude_Value_New = (data[21] << 8) | data[20];
+            
+            // If something changed, set the new values            
+            if (Compare_Value_U_New != Compare_Value_U_Current){
+				Set_New_Cmp_Value_U(Compare_Value_U_New, 0);
+				Compare_Value_U_Current = Compare_Value_U_New;}
+			if (Compare_Value_V_New != Compare_Value_V_Current){
+            	Set_New_Cmp_Value_U(Compare_Value_V_New, 1);
+            	Compare_Value_V_Current = Compare_Value_V_New;}
+			if (Compare_Value_W_New != Compare_Value_W_Current){           
+				Set_New_Cmp_Value_U(Compare_Value_W_New, 2);
+            	Compare_Value_W_Current = Compare_Value_W_New;}
+            if (Deadtime_New != Deadtime_Current){           
+				Set_Deadtime(Deadtime_New);
+            	Deadtime_Current = Deadtime_New;}
+            if (Frequency_New != Frequency_Current){           
+				//for (int i = 0; i < 3; i++) {
+        	    //ESP_ERROR_CHECK(mcpwm_timer_start_stop(timers[i], MCPWM_TIMER_STOP_FULL));
+				//vTaskDelay(pdMS_TO_TICKS(100));
+				//mcpwm_timer_disable(timers[i]); Geht nur ohne diese Zeile
+				//}
+				Frequency_Current = Frequency_New;
+				Set_Frequency_Dynamic(Frequency_New);
+				}
+			if (Phase_V_New != Phase_V_Current){           
+				Phase_V_Current = Phase_V_New;
+				Set_Phase_V(Phase_V_New);}
+			if (Phase_W_New != Phase_W_Current){
+				Phase_W_Current = Phase_W_New;
+				Set_Phase_W(Phase_W_New);}
+			if (Sequence_Current != Sequence_New && currentMode == MODE_NONE){
+				Sequence_Current = Sequence_New;
+				Set_Sequence(Sequence_New);
+				}	
+				
+				
+			if(Mode == MODE_BLDC_HALL && currentMode != MODE_BLDC_HALL)
+			{
+				hall_val = gpio_get_level(Hall_A) * 4 + gpio_get_level(Hall_B) * 2 + gpio_get_level(Hall_C) * 1;
+				Set_Hall_Sequence();			
+				currentMode = MODE_BLDC_HALL;
+			}
+			else if (Mode == MODE_NONE && currentMode == MODE_BLDC_HALL)
+			{
+				Set_Sequence(0); // Turn all off
+				currentMode = MODE_NONE;
+			}
+			
+			else if(Mode == MODE_AC_SINGLE_PHASE && currentMode != MODE_AC_SINGLE_PHASE)
+			{
+				//TODO: Platzhalter, muss hier was rein oder reicht es in main zu initalisieren?
+				currentMode = MODE_AC_SINGLE_PHASE;
+			}	
+			else if(Mode == MODE_NONE && currentMode == MODE_AC_SINGLE_PHASE)
+			{
+				currentMode = MODE_NONE;
+			}
+
+
+
+			if (Amplitude_Value_New != Amplitude_Value_Current){
+                 Amplitude_Value_Current = Amplitude_Value_New;
+        	}
+        	
+				
+			//uart_flush_input(UART_PORT); // We have sucessfully read one cycle. Lets flush the input buffer
+           
+           
+            
+         }
+		
+				
+       // Wait for X ms
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    
+        
+}
+
+
+void LED_Task(void *arg)
+{
+	uint8_t i = 1; 
+	gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+	SSD1306_t *dev_pt = configure_OLED(TAG);
+	
+	//TaskDelay(pdMS_TO_TICKS(4000));
+	
+	
+	 while (1) {
+        gpio_set_level(LED_GPIO, 1);  // LED AN
+        vTaskDelay(pdMS_TO_TICKS(250));
+        
+        
+        static uint8_t lastMode = MODE_NONE;
+        if(currentMode != lastMode){
+			ssd1306_clear_screen(dev_pt, false);
+			lastMode = currentMode;
+		}
+        
+        
+        if(currentMode == MODE_NONE){
+        	ssd1306_display_text(dev_pt, 2, "Waehle einen", strlen("Waehle einen"), false);
+			ssd1306_display_text(dev_pt, 3, "Modus", strlen("Modus"), false);
+        }
+        
+  		else if(currentMode == MODE_AC_SINGLE_PHASE){   
+	        
+	        snprintf(display_message, sizeof(display_message), "Amplitude : %.1f V", (double)Amplitude_Value_Current);
+	        ssd1306_display_text(dev_pt, 2, display_message, strlen(display_message), false); 
+			
+			snprintf(display_message, sizeof(display_message), "Frequ.: %.1fkHz", Frequency_New/1000.0);								//Variable anpassen
+	        ssd1306_display_text(dev_pt, 3, display_message, strlen(display_message), false); 	  
+		}
+		
+		else if(currentMode == MODE_BLDC_HALL){
+        
+	        snprintf(display_message, sizeof(display_message), "Duty U: %.1f%%", (double)Compare_Value_U_New/10.0);
+	        ssd1306_display_text(dev_pt, 0, display_message, strlen(display_message), false);    
+	        
+	        snprintf(display_message, sizeof(display_message), "Duty V: %.1f%%", (double)Compare_Value_V_New/10.0);
+	        ssd1306_display_text(dev_pt, 1, display_message, strlen(display_message), false);    
+	        
+	        snprintf(display_message, sizeof(display_message), "Duty W: %.1f%%", (double)Compare_Value_W_New/10.0);
+	        ssd1306_display_text(dev_pt, 2, display_message, strlen(display_message), false);    
+	        
+	        snprintf(display_message, sizeof(display_message), "Frequ.: %.1fkHz", Frequency_New/1000.0);
+	        ssd1306_display_text(dev_pt, 3, display_message, strlen(display_message), false);    
+	        
+	        ssd1306_display_text(dev_pt, 5, "UHULVHVLWHWL", strlen("UH UL VH VL WH WL"), false); 
+	        
+	        snprintf(display_message, sizeof(display_message), "%u %u %u %u %u %u", UH, UL, VH, VL, WH, WL);
+	        ssd1306_display_text(dev_pt, 6, display_message, strlen(display_message), false);    
+        }
+        
+        
+        if (connection_ready == true)
+        {
+			if (i == 1)
+			{
+			ssd1306_display_text(dev_pt, 7, "Connected", strlen("Connected   "), true);  
+			i = 2;	
+			}
+			else if  (i == 2)
+			{
+			ssd1306_display_text(dev_pt, 7, "Connected", strlen("Connected   "), false); 
+			i = 1;
+			}
+			connection_ready = false;
+		}
+		else 
+		{
+			ssd1306_display_text(dev_pt, 7, "Disconnected", strlen("Disconnected"), false);  
+		}
+        
+        
+        
+        gpio_set_level(LED_GPIO, 0);  // LED AUS
+        vTaskDelay(pdMS_TO_TICKS(250));
+               
+        
+        
+        Counter ++; 
+    }
+	
+}
+
+/*******************************************************************************************************************************/
+/******************************BLDC HALL *********************************************************************************************/
+/*******************************************************************************************************************************/
+
+void init_BLDC_HALL(void)
+{
+    ESP_LOGI(TAG, "Initializing BLDC Hall mode...");
+    
+    // PWM Timer Initialisierung
+    Init_Timers(Frequency_Current);
+
+    // Hall Sensor Capture Channels
+    ESP_LOGI(TAG, "Create Hall Sensor capture channels");
+    mcpwm_cap_timer_handle_t cap_timer = NULL;
+    mcpwm_capture_timer_config_t cap_timer_config = {
+        .group_id = 0,
+        .clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT,
+    };
+    
+    ESP_ERROR_CHECK(mcpwm_new_capture_timer(&cap_timer_config, &cap_timer));
+    mcpwm_cap_channel_handle_t cap_channels[3];
+    mcpwm_capture_channel_config_t cap_channel_config = {
+        .prescale = 1,
+        .flags.pull_up = false,
+        .flags.neg_edge = true,
+        .flags.pos_edge = true,
+    };
+    const int cap_chan_gpios[3] = {Hall_A, Hall_B, Hall_C};
+    for (int i = 0; i < 3; i++) {
+        cap_channel_config.gpio_num = cap_chan_gpios[i];
+        ESP_ERROR_CHECK(mcpwm_new_capture_channel(cap_timer, &cap_channel_config, &cap_channels[i]));
+    }
+
+	ESP_LOGI(TAG, "Register event callback for capture channels");
+    TaskHandle_t task_to_notify = xTaskGetCurrentTaskHandle();
+    for (int i = 0; i < 3; i++) {
+        mcpwm_capture_event_callbacks_t cbs = {
+            .on_cap = bldc_hall_updated,
+        };
+        ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(cap_channels[i], &cbs, task_to_notify));
+        ESP_ERROR_CHECK(mcpwm_capture_channel_enable(cap_channels[i]));
+    }
+
+	ESP_LOGI(TAG, "Enable and start capture timer");
+    ESP_ERROR_CHECK(mcpwm_capture_timer_enable(cap_timer));
+    ESP_ERROR_CHECK(mcpwm_capture_timer_start(cap_timer));
+
+    // ADC Task nur für BLDC-Hall
+    //xTaskCreate(ADC_Task, "ADC_Task", 4096, NULL, 10, &myTaskHandle_ADC);
+}
+
+void run_BLDC_HALL(void)
+{
+    ESP_LOGI(TAG, "Running BLDC Hall main loop...");
+    while (1)
+    {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    }
+}
+
+	
+	
+	
+	
+/*******************************************************************************************************************************/
+/*******************************Main*******************************************************************************************/
+/*******************************************************************************************************************************/
+
+
+/*	
+	void app_main(void)
+	{
+	 	
+	 	// Don not send loging data to the serial port
+	 	//esp_log_level_set("*", ESP_LOG_NONE);
+	 	// Create tasks
+	    xTaskCreate(ADC_Task, "ADC_Task", 4096, NULL, 10, &myTaskHandle_ADC);			//kein Funktionsaufruf, Registrierung als Task die später vom FreeRTOS-Scheudler automatisch aufgerufen wird 
+	    xTaskCreate(LED_Task, "LED_Task", 4096, NULL, 1, &myTaskHandle_LED);
+	    xTaskCreate(send_data_task, "send_data_task", 2048, NULL, 5, NULL);
+         
+	    //SSD1306_t *dev_pt = configure_OLED(TAG);    
+	        
+	  	// Configure ADC
+	    //adc1_config_width(ADC_WIDTH_BIT_12); // Set ADC width
+	    //adc1_config_channel_atten(ADC_CHANNEL_6, ADC_ATTEN_DB_12); // Set attenuation
+*/
+	  
+	    //ESP_LOGI(TAG, "Configure GPIO");
+	    /*
+	    gpio_config_t gpio_conf = {
+	        .pin_bit_mask = (1ULL << GPIO_TOGGLE_PIN),
+	        .mode = GPIO_MODE_OUTPUT,
+	        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+	        .pull_up_en = GPIO_PULLUP_DISABLE,
+	        .intr_type = GPIO_INTR_DISABLE
+	    };
+	    gpio_config(&gpio_conf);
+		*/
+	    
+	    
+	    /*********** Timer 0, 1, 2 anlegen in Set_Frequency *********************/
+	    
+/*	    Init_Timers(Frequency_Current);
+	 
+	 	// Chapture Channels: Whenever a change of the hall sensors values detected an interrupt points to the main while - loop
+	 
+	    ESP_LOGI(TAG, "Create Hall sensor capture channels");
+	    mcpwm_cap_timer_handle_t cap_timer = NULL;
+	    mcpwm_capture_timer_config_t cap_timer_config = {
+	        .group_id = 0,
+	        .clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT,
+	  
+	    };
+	    ESP_ERROR_CHECK(mcpwm_new_capture_timer(&cap_timer_config, &cap_timer));
+	    mcpwm_cap_channel_handle_t cap_channels[3];
+	    mcpwm_capture_channel_config_t cap_channel_config = {
+	        .prescale = 1,
+	        .flags.pull_up = false,
+	        .flags.neg_edge = true,
+	        .flags.pos_edge = true,
+	    };
+	    const int cap_chan_gpios[3] = {Hall_A, Hall_B, Hall_C};
+	    for (int i = 0; i < 3; i++) {
+	        cap_channel_config.gpio_num = cap_chan_gpios[i];
+	        ESP_ERROR_CHECK(mcpwm_new_capture_channel(cap_timer, &cap_channel_config, &cap_channels[i]));
+	    }
+	
+	    ESP_LOGI(TAG, "Register event callback for capture channels");
+	    TaskHandle_t task_to_notify = xTaskGetCurrentTaskHandle();
+	    for (int i = 0; i < 3; i++) {
+	        mcpwm_capture_event_callbacks_t cbs = {
+	            .on_cap = bldc_hall_updated,
+	        };
+	        ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(cap_channels[i], &cbs, task_to_notify));
+	    }
+	
+	    ESP_LOGI(TAG, "Enable capture channels");
+	    for (int i = 0; i < 3; i++) {
+	        ESP_ERROR_CHECK(mcpwm_capture_channel_enable(cap_channels[i]));
+	    }
+	
+	    ESP_LOGI(TAG, "Enable and start capture timer");
+	    ESP_ERROR_CHECK(mcpwm_capture_timer_enable(cap_timer));
+	    ESP_ERROR_CHECK(mcpwm_capture_timer_start(cap_timer));
+*/
+		/*
+		mcpwm_capture_timer_get_resolution(cap_timer, &Test_Frequency);
+		ESP_LOGI(TAG, "Timer Resolution: %lu", Test_Frequency);
+		Test_Frequency = Test_Frequency / 1000000;
+		*/
+	
+	
+	/******************Spielbereich **************/
+	// ADC mit DAM, bisher nicht funktioniert :-()
+	//https://docs.espressif.com/projects/esp-idf/en/release-v4.4/esp32/api-reference/peripherals/adc.html#_CPPv424adc_digi_configuration_t
+	
+	    
+	
+	    
+	    //ESP_ERROR_CHECK(adc1_config_width(ADC_WIDTH_BIT_DEFAULT));
+	    //ESP_ERROR_CHECK(adc1_config_channel_atten(ADC1_CHANNEL_6,  ADC_ATTEN_DB_12));
+	    
+	
+	    // 4. ADC starten
+	    //ret = adc_digi_start();
+	    //if (ret != ESP_OK) {
+	    //    ESP_LOGE(TAG, "Failed to start ADC");
+	    //    return;
+	    //}
+	
+	    // 5. Einmalige Messung durchführen
+	    //uint8_t dma_buffer[2];  // Puffer zum Lesen der ADC-Daten
+	    //size_t bytes_read = 0;
+	
+	    //ret = adc_digi_read_bytes(dma_buffer, sizeof(dma_buffer), &bytes_read, pdMS_TO_TICKS(1000));
+	    //if (ret == ESP_OK && bytes_read > 0) {
+	        // ADC-Wert extrahieren (12-Bit-Wert)
+	    //    uint16_t adc_value = ((dma_buffer[1] << 8) | dma_buffer[0]) & 0xFFF; // 12-Bit-Wert
+	    //    ESP_LOGI(TAG, "ADC Value: %d", adc_value);
+	    //} else if (ret == ESP_ERR_TIMEOUT) {
+	    //    ESP_LOGW(TAG, "ADC Timeout!");
+	    //}
+	
+	    // 6. ADC stoppen und Ressourcen freigeben
+	    //adc_digi_stop();
+	    //adc_digi_deinitialize();
+	    
+	    
+	    
+		
+	   /******************ENDE Spielbereich **************/
+	
+	
+/*
+	    while (1) {
+	        //ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, Strom_V, &adc_raw[1][0]));
+	        //ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, Strom_V, adc_raw[1][0]);
+	        //read_adc_values();
+	        //Original Example the task is triggered from the Hall Update
+	                
+	        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+	        //vTaskDelay(pdMS_TO_TICKS(1000));
+	     }
+	             
+	      
+	}
+*/
+
+void app_main(void)				//Testing neue Main mit modularem Aufbau
+{
+    // Logging & Grundkonfiguration
+    esp_log_level_set("*", ESP_LOG_INFO);						//Für Debuggen, zeigt Infos im Terminal an
+    //init_common_peripherals();
+
+    // Tasks, die immer laufen
+    xTaskCreate(ADC_Task, "ADC_Task", 4096, NULL, 10, &myTaskHandle_ADC);
+    xTaskCreate(LED_Task, "LED_Task", 4096, NULL, 1, &myTaskHandle_LED);
+    xTaskCreate(send_data_task, "send_data_task", 2048, NULL, 5, NULL);
+
+    // Warten auf Mode-Initialisierung durch send_data_task
+    ESP_LOGI(TAG, "Waiting for mode selection from send_data_task...");
+    
+    /*Warte bis Modus über UART/Simulink gewählt wurde
+    while (currentMode == MODE_NONE)
+    {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }*/
+
+    ESP_LOGI(TAG, "Mode selected: %d", currentMode);				//Info ans Terminal
+
+    // Jetzt Mode starten
+    switch (currentMode)
+    {
+        case MODE_BLDC_HALL:
+            init_BLDC_HALL();
+            run_BLDC_HALL();
+            break;
+
+        case MODE_AC_SINGLE_PHASE:
+            //init_AC_SinglePhase();
+            //run_AC_SinglePhase();
+            break;
+*/
+        /*case MODE_AC_TRIPLE_PHASE:
+            init_AC_TriplePhase();
+            run_AC_TriplePhase();
+            break;
+		*/
+/*        default:
+            ESP_LOGE(TAG, "Invalid mode!");
+            break;
+    }
+}
+
+
+
+
+
+
+
+/*******************************************************************************************************************************/
+/*******************************Functions*******************************************************************************************/
+/*******************************************************************************************************************************/
+
+void Set_New_Cmp_Value_U(uint32_t CMP_Percent_Val, uint8_t Port)
+	{
+	
+	 // Simulink only sends integer values for the duty. To increasy the accuracy Simulinks multiplies
+	 // the duty by ten. Example: 12.3% is send by 123. The µC has to divide the value by 10
+	 // Within this function the additional factor is considered within 1000 instead of 100 by calculating
+	 // the new CMP Values
+	 if(CMP_Percent_Val <= 990)
+	 {	uint32_t NewCMP_32 = 0;
+		//EXAMPLE_TIMER_PERIOD/2 = 100%	
+	 
+	 	double NewCMP = (Period/2)*CMP_Percent_Val /1000; //Von % umrechnen auf Absolutwert, aus Simulink kommt ein Wert *10
+		 NewCMP_32 = (uint32_t)NewCMP;
+	 	mcpwm_comparator_set_compare_value(comparators[Port], NewCMP_32);
+	 }
+		
+		
+	}
+
+void Set_Deadtime(uint32_t Deadtime)
+	{
+	
+	if (Deadtime >= 50) // Nur Werte > 0,312ns erlauben
+	{
+		//ESP_LOGI(TAG, "Setup deadtime");
+	    mcpwm_dead_time_config_t dt_config = {
+	         .posedge_delay_ticks = Deadtime, //1 entspricht 0,00625µs, 100 entspricht 0,625µs
+	         //.negedge_delay_ticks = 0,
+	    };
+	    for (int i = 0; i < 3; i++) {
+	        ESP_ERROR_CHECK(mcpwm_generator_set_dead_time(generators[i][0], generators[i][0], &dt_config));
+	    }
+	    dt_config = (mcpwm_dead_time_config_t) {
+	        .negedge_delay_ticks = Deadtime, //1 entspricht 0,00625µs, 100 entspricht 0,625µs
+	        //.posedge_delay_ticks = 0,
+	        .flags.invert_output = true,
+	    };
+	    for (int i = 0; i < 3; i++) {
+	        ESP_ERROR_CHECK(mcpwm_generator_set_dead_time(generators[i][1], generators[i][1], &dt_config)); // Früher 0, 1
+	    }
+	  }
+	
+	}
+	
+void Set_Frequency_Dynamic(uint16_t Frequency)
+{
+	double Calculated_Period = 0;
+	//uint32_t Period = 0; Muss globale Variable sein, da auch von Set_New_Cmp_Value benötigt
+	
+	Calculated_Period = 1.0 / Frequency;
+	Calculated_Period = Calculated_Period * TIMER_RESOLUTION_HZ; // Neue Periode = 1/Frequenz  x Clock-Timer
+	
+	Period = (uint32_t)Calculated_Period;
+	
+	mcpwm_timer_set_period(timers[0], Period);
+	mcpwm_timer_set_period( timers[1], Period);
+	mcpwm_timer_set_period( timers[2], Period);
+	
+	Set_New_Cmp_Value_U(Compare_Value_U_New, 0);
+	Set_New_Cmp_Value_U(Compare_Value_V_New, 1);
+	Set_New_Cmp_Value_U(Compare_Value_W_New, 2);
+	
+}
+
+void Set_Phase_V(uint16_t Phase)
+{
+	
+	double Calculated_Phase = 0;		
+	Calculated_Phase = (Period/2);
+	Calculated_Phase = (Calculated_Phase - 1)/180;
+	Calculated_Phase = Calculated_Phase * Phase;
+	// For Timer V (timers[1])
+    //ESP_LOGI(TAG, "Set timer V sync to the first timer");
+    mcpwm_timer_sync_phase_config_t sync_phase_config_UV = {
+        .count_value = (uint32_t)Calculated_Phase,									
+        .direction = MCPWM_TIMER_DIRECTION_UP,
+        .sync_src = timer_sync_source,
+    };
+    ESP_ERROR_CHECK(mcpwm_timer_set_phase_on_sync(timers[1], &sync_phase_config_UV));
+		
+}
+
+void Set_Phase_W(uint16_t Phase)
+{
+	
+	double Calculated_Phase = 0;		
+	Calculated_Phase = (Period/2);
+	Calculated_Phase = (Calculated_Phase - 1)/180;
+	Calculated_Phase = Calculated_Phase * Phase;
+	// For Timer V (timers[1])
+    //ESP_LOGI(TAG, "Set timer V sync to the first timer");
+    mcpwm_timer_sync_phase_config_t sync_phase_config_UV = {
+        .count_value = (uint32_t)Calculated_Phase,									
+        .direction = MCPWM_TIMER_DIRECTION_UP,
+        .sync_src = timer_sync_source,
+    };
+    ESP_ERROR_CHECK(mcpwm_timer_set_phase_on_sync(timers[2], &sync_phase_config_UV));
+		
+}
+
+void Set_Sequence(uint16_t Sequence)
+{
+	
+		
+	UH = (Sequence & (1 << 5)) != 0;
+	UL = (Sequence & (1 << 4)) != 0;
+	VH = (Sequence & (1 << 3)) != 0;
+	VL = (Sequence & (1 << 2)) != 0;
+	WH = (Sequence & (1 << 1)) != 0;
+	WL = (Sequence & (1 << 0)) != 0;
+	
+	//generators[0][0] -> UH
+	//generators[0][1] -> UL
+	//generators[1][0] -> VH
+	//generators[1][1] -> VL
+	//generators[2][0] -> WH
+	//generators[2][1] -> WL
+	
+	// Varianten
+	// I. Falls XH = 1 -> PWM Kanal aktivieren 
+    // II. Falls XH = 0 && XL = 0 -> PWM deaktivieren und beide GPIO auf LOW setzen
+    // III. FAlls XH = 0 && XL = 1 -> XH deaktivieren, XL automatisch auf 1
+    
+    // Achtung und merkwürdig: Funktioniert nur wenn Low-Side zuerst gesetzt wird!! Ansonsten keine Reakteion!!!
+	/* PHASE U */
+	if (UH == true) {			
+	mcpwm_generator_set_force_level(generators[0][1], -1, true);
+	mcpwm_generator_set_force_level(generators[0][0], -1, true);
+	}
+	
+	if (UH == false && UL == false) {
+	mcpwm_generator_set_force_level(generators[0][1], 1, true);
+	mcpwm_generator_set_force_level(generators[0][0], 0, true);
+	
+	}	
+	
+	if (UH == false && UL == true) {
+	mcpwm_generator_set_force_level(generators[0][1], 0, true);
+	mcpwm_generator_set_force_level(generators[0][0], 0, true);
+	}	
+	/* PHASE V */
+	if (VH == true) {			
+	mcpwm_generator_set_force_level(generators[1][1], -1, true);
+	mcpwm_generator_set_force_level(generators[1][0], -1, true);
+	}
+	
+	if (VH == false && VL == false) {
+	mcpwm_generator_set_force_level(generators[1][1], 1, true);
+	mcpwm_generator_set_force_level(generators[1][0], 0, true);
+	
+	}	
+	
+	if (VH == false && VL == true) {
+	mcpwm_generator_set_force_level(generators[1][1], 0, true);
+	mcpwm_generator_set_force_level(generators[1][0], 0, true);
+	}	
+	
+	/* PHASE W */
+	if (WH == true) {			
+	mcpwm_generator_set_force_level(generators[2][1], -1, true);
+	mcpwm_generator_set_force_level(generators[2][0], -1, true);
+	}
+	
+	if (WH == false && WL == false) {
+	mcpwm_generator_set_force_level(generators[2][1], 1, true);
+	mcpwm_generator_set_force_level(generators[2][0], 0, true);
+	
+	}	
+	
+	if (WH == false && WL == true) {
+	mcpwm_generator_set_force_level(generators[2][1], 0, true);
+	mcpwm_generator_set_force_level(generators[2][0], 0, true);
+	}	
+	
+
+	
+	
+}
+
+void Set_Hall_Sequence(void)
+
+{
+	switch (hall_val) {
+				case 1:
+					Set_Sequence(6);
+				break;
+				case 3:
+					Set_Sequence(18);
+				break;
+				case 2:
+					Set_Sequence(24);
+				break;
+				case 6:
+					Set_Sequence(9);
+				break;
+				case 4:
+					Set_Sequence(33);
+				break;
+				case 5:
+					Set_Sequence(36);
+				break;
+			}	
+	
+}
+
+
+
+void Init_Timers(uint16_t Frequency)
+{
+	// Variable für die berechnete Periodendauer in Timer-Ticks
+	double Calculated_Period = 0;
+	//uint32_t Period = 0; Muss globale Variable sein, da auch von Set_New_Cmp_Value benötigt
+	
+	// Periodendauer (in Sekunden) = 1 / Frequenz
+	Calculated_Period = 1.0 / Frequency;
+	// Umrechnung in Timer-Ticks anhand der Auflösung (z. B. 160 MHz)
+	Calculated_Period = Calculated_Period * TIMER_RESOLUTION_HZ; // Neue Periode = 1/Frequenz  x Clock-Timer
+	
+	// Ergebnis als ganzzahlige Anzahl Timer-Ticks speichern
+	Period = (uint32_t)Calculated_Period;
+	
+	// --- MCPWM Timer-Konfiguration ---
+	mcpwm_timer_config_t timer_config = {
+        .clk_src = MCPWM_TIMER_CLK_SRC_PLL160M,						// 160 MHz PLL-Taktquelle
+        .group_id = 0,												// MCPWM-Gruppe 0
+        .intr_priority = 0,											//Standard Interrupt Priority
+        .resolution_hz = TIMER_RESOLUTION_HZ,						// Auflösung in Hz
+        .period_ticks = Period,										//Anzahl Ticks pro Periode (PWM-Frequenz)
+        .count_mode = MCPWM_TIMER_COUNT_MODE_UP_DOWN,				//Symmetrische PWM für UP-Down-Count
+    }; 
+    
+    /*********** Timer 0, 1, 2 anlegen für U, V, W *********************/
+     
+    ESP_ERROR_CHECK(mcpwm_new_timer(&timer_config, &timers[0]));	// Timer 0 (Phase U)
+    ESP_ERROR_CHECK(mcpwm_new_timer(&timer_config, &timers[1])); // Timer 0 (Phase V)
+    ESP_ERROR_CHECK(mcpwm_new_timer(&timer_config, &timers[2])); // Timer 0 (Phase W)
+	
+	//ESP_LOGI(TAG, "Create operators");
+	
+	// --- MCPWM Operatoren erstellen ---
+    mcpwm_operator_config_t operator_config = {
+        .group_id = 0, // Operatoren in derselben MCPWM-Gruppe wie Timer
+    };
+    for (int i = 0; i < 3; ++i) {
+		// Je einen Operator pro Timer erzeugen
+        ESP_ERROR_CHECK(mcpwm_new_operator(&operator_config, &operators[i]));
+    }
+
+	// --- Timer und Operatoren verbinden ---
+    ESP_LOGI(TAG, "Connect timers and operators with each other");
+    for (int i = 0; i < 3; i++) {
+		// Jeder Operator wird mit seinem zugehörigen Timer gekoppelt
+        ESP_ERROR_CHECK(mcpwm_operator_connect_timer(operators[i], timers[i]));
+    }
+   
+      
+   
+    
+    //ESP_LOGI(TAG, "Create comparators");
+    //mcpwm_cmpr_handle_t comparators[3]; // Wird global gemacht zur Änderung über Funktion
+    
+    // --- MCPWM Komparatoren (Duty-Cycle-Steuerung) erstellen ---
+    mcpwm_comparator_config_t compare_config = {						//Standardkonfiguration
+        //.flags.update_cmp_on_tez = true,								//Update bei Timer counts to zero
+    };
+    for (int i = 0; i < 3; i++) {
+		// Comparator für jeden Operator erstellen
+        ESP_ERROR_CHECK(mcpwm_new_comparator(operators[i], &compare_config, &comparators[i]));
+        
+        //ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(comparators[i], Compare_Value_U_Current));
+    }
+    
+     // Anfangswerte der Duty-Cycles (Compare-Werte) setzen
+    Set_New_Cmp_Value_U(Compare_Value_U_New, 0);
+	Set_New_Cmp_Value_U(Compare_Value_V_New, 1);
+	Set_New_Cmp_Value_U(Compare_Value_W_New, 2);
+    
+	//ESP_LOGI(TAG, "Create PWM generators");
+		
+         
+    // --- PWM-Generatoren für High- und Low-Side MOSFETs konfigurieren ---
+    const int gen_gpios[3][2] = {
+        {BLDC_PWM_UH_GPIO, BLDC_PWM_UL_GPIO},		//Phase U: High & Low
+        {BLDC_PWM_VH_GPIO, BLDC_PWM_VL_GPIO},		//Phase V: High & Low
+        {BLDC_PWM_WH_GPIO, BLDC_PWM_WL_GPIO},		//Phase W: High & Low
+    };
+    
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 2; j++) {
+			// GPIO für den jeweiligen Generator setzen
+            gen_config.gen_gpio_num = gen_gpios[i][j];
+            //gen_config.flags.pull_down = true;								// Pull Down
+            // Generator (PWM-Ausgang) erstellen
+            ESP_ERROR_CHECK(mcpwm_new_generator(operators[i], &gen_config, &generators[i][j]));
+        }
+    }
+
+
+	// generators[i][0], für alle high-Side Mosfets, Invertierung erfolgt bei der Todzeiteinstellung
+
+	//ESP_LOGI(TAG, "Set generator actions on timer and compare event");
+	// --- Generator-Aktionen für die High-Side MOSFETs ---
+    for (int i = 0; i < 3; i++) {
+        ESP_ERROR_CHECK(mcpwm_generator_set_actions_on_compare_event(generators[i][0],  //High-Side Generator
+                    MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparators[i], MCPWM_GEN_ACTION_LOW),	//Beim Hochzählen: LOW bei Compare
+                    MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_DOWN, comparators[i], MCPWM_GEN_ACTION_HIGH),		//Beim Runterzählen: HIGH bei Compare
+                    MCPWM_GEN_COMPARE_EVENT_ACTION_END()));
+    }
+    
+    // generators[i][1], für alle low-Side Mosfets, Invertierung erfolgt bei der Todzeiteinstellung
+
+	//ESP_LOGI(TAG, "Set generator actions on timer and compare event");
+	// --- Generator-Aktionen für die Low-Side MOSFETs ---
+    for (int i = 0; i < 3; i++) {
+        ESP_ERROR_CHECK(mcpwm_generator_set_actions_on_compare_event(generators[i][1],	//Low-Side Generator
+                    MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparators[i], MCPWM_GEN_ACTION_LOW),
+                    MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_DOWN, comparators[i], MCPWM_GEN_ACTION_HIGH),
+                    MCPWM_GEN_COMPARE_EVENT_ACTION_END()));
+    }
+    
+    
+    
+	
+	// --- Totzeit (Deadtime) zwischen High-/Low-Side einstellen ---
+	Set_Deadtime(Deadtime_Current);
+	
+	// --- Alle PWM-Ausgänge zunächst deaktivieren (Sicherheitszustand) ---
+	Set_Sequence(Sequence_New); // turn all off
+	
+	// --- Interrupts für Timer0 registrieren ---
+	//ESP_LOGI(TAG, "Register timer interrupts");
+	    ESP_ERROR_CHECK(mcpwm_timer_register_event_callbacks(timers[0], &(mcpwm_timer_event_callbacks_t){
+        .on_empty = timer0_isr		//INterrupt at TOP Level  // ISR wird aufgerufen, wenn Timer "leer" (TEZ) ist
+    }, NULL));
+    //ESP_ERROR_CHECK(mcpwm_timer_enable(timers[0]));
+	
+
+
+
+	// --- Alle Timer aktivieren und starten ---
+    //ESP_LOGI(TAG, "Start timers");
+    for (int i = 0; i < 3; i++) {
+        ESP_ERROR_CHECK(mcpwm_timer_enable(timers[i]));
+        ESP_ERROR_CHECK(mcpwm_timer_start_stop(timers[i], MCPWM_TIMER_START_NO_STOP));
+        
+    }
+    
+    
+   	//          +->timer1
+    // (TEZ)    |
+    // timer0---+
+    //          |
+    //          +->timer2
+    //ESP_LOGI(TAG, "Create TEZ sync source from timer0");
+    
+    // --- Synchronisationsquelle von Timer0 erzeugen ---
+    mcpwm_timer_sync_src_config_t timer_sync_config = {
+        .timer_event = MCPWM_TIMER_EVENT_EMPTY, // generate sync event on timer empty
+    };
+    ESP_ERROR_CHECK(mcpwm_new_timer_sync_src(timers[0], &timer_sync_config, &timer_sync_source));
+
+	// For Timer V (timers[1])
+    //ESP_LOGI(TAG, "Set timer V sync to the first timer");
+    // --- Timer1 (Phase V) mit Timer0 synchronisieren ---
+    mcpwm_timer_sync_phase_config_t sync_phase_config_UV = {
+        .count_value = Phase_V_Current,							// Phasenverschiebung (z. B. 120°)			
+        .direction = MCPWM_TIMER_DIRECTION_UP,					// Richtung bei Start
+        .sync_src = timer_sync_source,							// Sync-Quelle = Timer0
+    };
+    ESP_ERROR_CHECK(mcpwm_timer_set_phase_on_sync(timers[1], &sync_phase_config_UV));
+
+	// For Timer W (timers[2])
+    //ESP_LOGI(TAG, "Set timer V sync to the first timer");
+    // --- Timer2 (Phase W) mit Timer0 synchronisieren ---
+    mcpwm_timer_sync_phase_config_t sync_phase_config_UW = {
+        .count_value = Phase_W_Current,									
+        .direction = MCPWM_TIMER_DIRECTION_UP,
+        .sync_src = timer_sync_source,
+    };
+   	ESP_ERROR_CHECK(mcpwm_timer_set_phase_on_sync(timers[2], &sync_phase_config_UW));
+	
+	
+}
+
+
+
